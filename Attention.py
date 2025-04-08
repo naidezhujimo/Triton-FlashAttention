@@ -280,12 +280,12 @@ def flash_attention_v3(
 
     # 主循环
     for start_n in range(0, seq_len, BLOCK_N):
-        # 加载当前K/V块（关键修改：直接存储为FP8）
+        # 加载当前K/V块
         curr_k = tl.load(k_block_ptr, boundary_check=(0,)).to(tl.float8e5 if USE_FP8 else tl.float32)
         curr_v = tl.load(v_block_ptr, boundary_check=(0,)).to(tl.float8e5 if USE_FP8 else tl.float32)
 
         if USE_FP8:
-            # FP8计算（无需反量化）
+            # FP8计算
             k_scale = 127.0 / tl.max(tl.abs(curr_k.to(tl.float32))) + 1e-6
             v_scale = 127.0 / tl.max(tl.abs(curr_v.to(tl.float32))) + 1e-6
             
@@ -305,11 +305,11 @@ def flash_attention_v3(
         l_curr = alpha * l_i + tl.sum(beta, axis=1)
         p = beta / (l_curr[:, None] + 1e-6)
 
-        # 累加输出（FP8直接累加）
+        # 累加输出（提升至FP32）
         if USE_FP8:
-            p = p.to(tl.float8e5)
-            curr_v_scaled = (curr_v * v_scale).to(tl.float8e5)
-            acc = tl.dot(p, curr_v_scaled).to(acc_dtype) + acc
+            p_fp32 = p.to(tl.float32)
+            curr_v_fp32 = curr_v.to(tl.float32) * v_scale
+            acc += tl.dot(p_fp32, curr_v_fp32)
         else:
             acc += tl.dot(p, curr_v.to(tl.float32))
 
@@ -563,7 +563,7 @@ def benchmark_fn(fn, args, num_repeats=1000):
     trimmed_times = times[50:-50]  # 去掉前5%和后5%的异常值
     return sum(trimmed_times) / len(trimmed_times)
 
-from timeit import Timer
+
 """基准测试函数"""
 def benchmark_attention():
     torch.manual_seed(42)
@@ -602,11 +602,11 @@ def benchmark_attention():
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
             
-            # 测量时间（使用修改后的 benchmark_fn）
+            # 测量时间
             time_ms = benchmark_fn(fn, args, num_repeats=1000)
             results[name] = time_ms
             
-            # 测量显存（保持原有逻辑）
+            # 测量显存
             fn(*args)
             torch.cuda.synchronize()
             peak_mem = torch.cuda.max_memory_allocated() / 1024**2
