@@ -12,23 +12,23 @@ def flash_attention_v1(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    # 新增：二维网格布局（序列分块，特征分块）
+    # 二维网格布局（序列分块，特征分块）
     pid_m = tl.program_id(0)  # 处理序列维度的分块
-    pid_d = tl.program_id(1)  # 新增：处理特征维度的分块
+    pid_d = tl.program_id(1)  # 处理特征维度的分块
     
     # 计算分块起始位置
     start_m = pid_m * BLOCK_M
-    start_d = pid_d * BLOCK_D  # 新增：特征维度分块起始
+    start_d = pid_d * BLOCK_D  # 特征维度分块起始
     
     # 生成局部偏移
     offs_m = start_m + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
-    offs_d = start_d + tl.arange(0, BLOCK_D)  # 修改：基于分块起始的特征偏移
+    offs_d = start_d + tl.arange(0, BLOCK_D)  # 基于分块起始的特征偏移
 
     # 初始化累加器（调整为分块大小）
     m_prev = tl.full((BLOCK_M, ), float('-inf'), dtype=tl.float32)
     l_prev = tl.zeros((BLOCK_M, ), dtype=tl.float32)
-    acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)  # 修改：BLOCK_D维度
+    acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)  # BLOCK_D维度
 
     # 加载Q分块 [BLOCK_M, BLOCK_D]
     q = tl.load(
@@ -44,14 +44,14 @@ def flash_attention_v1(
 
         # 加载K分块 [BLOCK_N, BLOCK_D]
         k = tl.load(
-            k_ptr + offs_n[:, None] * stride_km + offs_d[None, :],  # 特征维度对齐
+            k_ptr + offs_n[:, None] * stride_km + offs_d[None, :],
             mask=mask_n[:, None] & (offs_d[None, :] < d_model),
             other=0.0
         ).to(tl.float32)
         
         # V分块加载需对齐特征维度
         v = tl.load(
-            v_ptr + offs_n[:, None] * stride_vm + offs_d[None, :],  # 增加特征偏移
+            v_ptr + offs_n[:, None] * stride_vm + offs_d[None, :],
             mask=mask_n[:, None] & (offs_d[None, :] < d_model),
             other=0.0
         ).to(tl.float32)
@@ -91,10 +91,10 @@ def call_flash_attention_v1(q, k, v):
 
     BLOCK_M, BLOCK_N, BLOCK_D = 64, 64, 64
     
-    # 修改为二维网格布局
+    # 二维网格布局
     grid = (
         triton.cdiv(seq_len, BLOCK_M),  # 序列维度分块数
-        triton.cdiv(d_model, BLOCK_D)   # 新增：特征维度分块数
+        triton.cdiv(d_model, BLOCK_D)   # 特征维度分块数
     )
 
     flash_attention_v1[grid](
