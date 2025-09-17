@@ -41,7 +41,7 @@ v = torch.randn_like(q)
 output = call_flash_attention_v2(q, k, v, is_causal=True)
 ```
 
-### Version Comparison
+### Version Comparison                              (FP8 not enabled)
 | Feature               | v1          | v2          | v3          |
 |-----------------------|-------------|-------------|-------------|
 | Multi-head Support    | ❌          | ✅          | ✅          |
@@ -66,10 +66,10 @@ benchmark_attention(config)
 ### Runtime Comparison (1024 sequence length)
 | Implementation        | Time (ms) | Memory (MB) |
 |-----------------------|-----------|-------------|
-| PyTorch Native        | 0.507     |    19.65   |
-| FlashAttention-v1     | 0.072     |   10.88    |
-| FlashAttention-v2     | 0.065     |   10.62    |
-| FlashAttention-v3     | 0.059     |   10.62    |
+| PyTorch Native        | 1.15     |    19.65   |
+| FlashAttention-v1     | 0.50     |   10.88    |
+| FlashAttention-v2     | 0.31     |   10.62    |
+| FlashAttention-v3     | 0.12     |   10.62    | (FP8 not enabled)
 
 ### Key Optimizations
 1. **Block-wise Processing**:
