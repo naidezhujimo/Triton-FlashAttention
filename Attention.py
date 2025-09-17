@@ -7,30 +7,28 @@ from timeit import Timer
 def flash_attention_v1(
     q_ptr, k_ptr, v_ptr, o_ptr,
     seq_len, d_model: tl.constexpr,
-    stride_qm, stride_km, stride_vm,
+    stride_qm, stride_km, stride_vm, stride_om,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
+    IS_CAUSAL: tl.constexpr
 ):
-    # 二维网格布局（序列分块，特征分块）
+    # 一维网格上并行（序列分块）
     pid_m = tl.program_id(0)  # 处理序列维度的分块
-    pid_d = tl.program_id(1)  # 处理特征维度的分块
-    
+
     # 计算分块起始位置
     start_m = pid_m * BLOCK_M
-    start_d = pid_d * BLOCK_D  # 特征维度分块起始
-    
+
     # 生成局部偏移
     offs_m = start_m + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
-    offs_d = start_d + tl.arange(0, BLOCK_D)  # 基于分块起始的特征偏移
-
+    offs_d = tl.arange(0, d_model)
+    
     # 初始化累加器（调整为分块大小）
     m_prev = tl.full((BLOCK_M, ), float('-inf'), dtype=tl.float32)
     l_prev = tl.zeros((BLOCK_M, ), dtype=tl.float32)
-    acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)  # BLOCK_D维度
+    acc = tl.zeros((BLOCK_M, d_model), dtype=tl.float32)
 
-    # 加载Q分块 [BLOCK_M, BLOCK_D]
+    # 加载Q分块 [BLOCK_M, d_model]
     q = tl.load(
         q_ptr + offs_m[:, None] * stride_qm + offs_d[None, :],
         mask=(offs_m[:, None] < seq_len) & (offs_d[None, :] < d_model),
@@ -40,16 +38,19 @@ def flash_attention_v1(
     # 遍历K/V块
     for start_n in range(0, seq_len, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < seq_len
+        mask_m = offs_m < seq_len  # Q序列的有效位置
+        mask_n = offs_n < seq_len  # K序列的有效位置
+        # 创建序列长度掩码
+        seq_mask = mask_m[:, None] & mask_n[None, :]  # 组合成二维掩码
 
-        # 加载K分块 [BLOCK_N, BLOCK_D]
+        # 加载K分块 [BLOCK_N, d_model]
         k = tl.load(
             k_ptr + offs_n[:, None] * stride_km + offs_d[None, :],
             mask=mask_n[:, None] & (offs_d[None, :] < d_model),
             other=0.0
         ).to(tl.float32)
         
-        # V分块加载需对齐特征维度
+        # V分块加载需对齐特征维度 [BLOCK_N, d_model]
         v = tl.load(
             v_ptr + offs_n[:, None] * stride_vm + offs_d[None, :],
             mask=mask_n[:, None] & (offs_d[None, :] < d_model),
@@ -60,8 +61,12 @@ def flash_attention_v1(
         s = tl.dot(q, k.T)
         s *= 1.0 / tl.sqrt(tl.cast(d_model, tl.float32))
 
-        # 掩码无效位置
-        s = tl.where(mask_n[None, :], s, float('-inf'))
+        # 处理因果掩码
+        if IS_CAUSAL:
+            causal_mask = (offs_m[:, None]) >= (start_n + offs_n[None, :])
+            seq_mask = seq_mask & causal_mask  # 合并两种掩码
+            
+        s = tl.where(causal_mask, s, float('-inf'))
 
         # 在线Softmax
         m_curr = tl.maximum(tl.max(s, axis=1), m_prev)
@@ -71,7 +76,7 @@ def flash_attention_v1(
         p = beta / l_curr[:, None]
         
         # 分块累加需限制维度
-        acc += tl.dot(p, v)  # [BLOCK_M, BLOCK_D]
+        acc += tl.dot(p, v)  # [BLOCK_M, d_model]
 
         # 保存中间变量
         m_prev = m_curr
@@ -79,31 +84,29 @@ def flash_attention_v1(
 
     # 写入最终结果（对齐特征分块）
     tl.store(
-        o_ptr + offs_m[:, None] * stride_qm + offs_d[None, :],
+        o_ptr + offs_m[:, None] * stride_om + offs_d[None, :],
         acc,
         mask=(offs_m[:, None] < seq_len) & (offs_d[None, :] < d_model)
     )
 
-def call_flash_attention_v1(q, k, v):
+def call_flash_attention_v1(q, k, v, is_causal=False):
     assert q.shape == k.shape == v.shape, "Input shapes must match"
     seq_len, d_model = q.shape
     o = torch.empty_like(q)
 
-    BLOCK_M, BLOCK_N, BLOCK_D = 64, 64, 64
+    BLOCK_M, BLOCK_N = 32, 32
     
-    # 二维网格布局
-    grid = (
-        triton.cdiv(seq_len, BLOCK_M),  # 序列维度分块数
-        triton.cdiv(d_model, BLOCK_D)   # 特征维度分块数
-    )
+    # 一维网格布局（只在序列维度分块）
+    grid = (triton.cdiv(seq_len, BLOCK_M),)
+
 
     flash_attention_v1[grid](
         q, k, v, o,
         seq_len, d_model,
-        q.stride(0), k.stride(0), v.stride(0),
+        q.stride(0), k.stride(0), v.stride(0), o.stride(0),
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        BLOCK_D=BLOCK_D,
+        IS_CAUSAL=is_causal
     )
     return o
 
@@ -165,10 +168,17 @@ def flash_attention_v2(
         s = tl.dot(q, k.T.to(q.dtype))
         s = s * (1.0 / tl.sqrt(tl.cast(head_dim, tl.float32)))
 
+        # 创建序列长度掩码
+        mask_m = offs_m < seq_len  # Q序列的有效位置
+        mask_n = offs_n < seq_len  # K序列的有效位置
+        seq_mask = mask_m[:, None] & mask_n[None, :]  # 组合成二维掩码
+
         # 4.5 处理因果掩码
         if IS_CAUSAL:
             causal_mask = (offs_m[:, None]) >= (start_n + offs_n[None, :])
-            s = tl.where(causal_mask, s, float('-inf'))
+            seq_mask = seq_mask & causal_mask  # 合并两种掩码
+            
+        s = tl.where(causal_mask, s, float('-inf'))
 
         # 4.6 在线Softmax更新
         # 计算当前块的行最大值
@@ -232,7 +242,8 @@ def flash_attention_v3(
     stride_vm, stride_vh,
     BLOCK_M: tl.constexpr, 
     BLOCK_N: tl.constexpr,
-    USE_FP8: tl.constexpr
+    USE_FP8: tl.constexpr,
+    IS_CAUSAL: tl.constexpr
 ):
     pid = tl.program_id(0)
     start_m = pid * BLOCK_M
@@ -298,6 +309,17 @@ def flash_attention_v3(
         
         s = s * (1.0 / tl.sqrt(tl.cast(head_dim, tl.float32)))
 
+        # 创建序列长度掩码
+        mask_m = offs_m < seq_len  # Q序列的有效位置
+        mask_n = offs_n < seq_len  # K序列的有效位置
+        seq_mask = mask_m[:, None] & mask_n[None, :]  # 组合成二维掩码
+
+        # 4.5 处理因果掩码
+        if IS_CAUSAL:
+            causal_mask = (offs_m[:, None]) >= (start_n + offs_n[None, :])
+            seq_mask = seq_mask & causal_mask  # 合并两种掩码
+            
+        s = tl.where(causal_mask, s, float('-inf'))
         # 在线Softmax
         m_curr = tl.maximum(tl.max(s, axis=1), m_i)
         alpha = tl.exp(m_i - m_curr)
@@ -330,7 +352,7 @@ def flash_attention_v3(
 
 
 
-def call_flash_attention_v3(q, k, v, use_fp8=False):
+def call_flash_attention_v3(q, k, v, use_fp8=False, is_causal=False):
     assert q.dim() == 3, "Input should be [seq_len, num_heads, head_dim]"
     
     # 强制输入输出为FP8格式（PyTorch 2.1+）
@@ -357,6 +379,7 @@ def call_flash_attention_v3(q, k, v, use_fp8=False):
         q.stride(1), q.stride(0),
         k.stride(1), k.stride(0),
         v.stride(1), v.stride(0),
+        IS_CAUSAL=is_causal,
         **config
     )
     return o
@@ -589,9 +612,9 @@ def benchmark_attention():
 
         test_cases = [
             ('PyTorch Native', pytorch_attention, (q_single, k_single, v_single, False, head_size)),
-            ('FlashAttention-v1', call_flash_attention_v1, (q_single, k_single, v_single)),
-            ('FlashAttention-v2', call_flash_attention_v2, (q_multi, k_multi, v_multi, False)),
-            ('FlashAttention-v3', call_flash_attention_v3, (q_multi, k_multi, v_multi, False)),
+            ('FlashAttention-v1', call_flash_attention_v1, (q_single, k_single, v_single, True)),
+            ('FlashAttention-v2', call_flash_attention_v2, (q_multi, k_multi, v_multi, True)),
+            ('FlashAttention-v3', call_flash_attention_v3, (q_multi, k_multi, v_multi, False, True)),
         ]
 
         # 运行基准测试
